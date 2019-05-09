@@ -3,8 +3,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/eventfd.h>
+#include <sys/epoll.h>
 #include <rdma/rdma_cma.h>
-#include<iostream>
+#include <map>
+#include <vector>
+#include <iostream>
 #include "get_clock.h"
 
 #define TEST_NZ(x) do { if ( (x)) die("error: " #x " failed (returned non-zero)." ); } while (0)
@@ -36,6 +40,27 @@ struct connection {
   int num_completions;
 };
 
+struct para
+{
+  int efd;
+  char *filename;
+//  struct ibv_send_wr wr;
+};
+
+struct para_worker
+{
+  int num;
+  int *efd;
+//  map <int, struct ibv_send_wr> m;
+};
+
+struct para_wr
+{
+  uint64_t addr;
+  uint32_t length;
+  uint32_t lkey;
+};
+
 static void die(const char *reason);
 
 static void build_context(struct ibv_context *verbs);
@@ -47,6 +72,7 @@ static void register_memory(struct connection *conn);
 static int on_addr_resolved(struct rdma_cm_id *id);
 static void on_completion(struct ibv_wc *wc);
 void * on_connection(void *arg);
+void * worker(void *arg);
 static int on_disconnect(struct rdma_cm_id *id);
 static int on_event(struct rdma_cm_event *event);
 static int on_route_resolved(struct rdma_cm_id *id);
@@ -54,6 +80,12 @@ static int on_route_resolved(struct rdma_cm_id *id);
 static struct context *s_ctx = NULL;
 struct rdma_cm_id *conn_id= NULL;
 struct connection *conn_ctx = NULL;
+
+map <int, vector<struct para_wr>> m;
+
+int iters = 1000;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 int main(int argc, char **argv)
 {
@@ -86,25 +118,49 @@ int main(int argc, char **argv)
 
   conn_ctx = (struct connection *)(conn_id->context);
 
+  pthread_t worker_t;
   pthread_t *t = new pthread_t[thread_num];
+  int *efd = new int[thread_num];
+//  struct ibv_send_wr *wr = new struct ibv_send_wr[thread_num];
   char **filename = new char*[thread_num];
+  struct para *parameters = new struct para[thread_num];
+  struct para_worker parameters_worker;
+//  map <int, struct ibv_send_wr> m;
   void *status;
 
   for(int i = 0; i < thread_num; i++)
   {
     filename[i] = new char[20];
     snprintf(filename[i], 20, "./out/out%d.list", i + 1);
-    pthread_create(&t[i], NULL, on_connection, filename[i]);
+    efd[i] = eventfd(0, 0);
+    parameters[i].filename = filename[i];
+    parameters[i].efd = efd[i];
+//    pthread_create(&t[i], NULL, on_connection, &(parameters[i]));
+  }
+  parameters_worker.num = thread_num;
+  parameters_worker.efd = efd;
+//  parameters_worker.m = m;
+
+  pthread_create(&worker_t, NULL, worker, &parameters_worker);
+
+  for(int i = 0; i < thread_num; i++)
+  {
+    pthread_create(&t[i], NULL, on_connection, &(parameters[i]));
   }
 
   for(int i = 0; i < thread_num; i++)
     pthread_join(t[i], &status);
+
+//  pthread_join(s_ctx->cq_poller_thread, &status);
+  pthread_join(worker_t, &status);
 
   delete []t;
   for(int i = 0; i < thread_num; i++)
     delete []filename[i];
 
   delete []filename;
+  delete []efd;
+  delete []parameters;
   rdma_destroy_event_channel(ec);
 
   return 0;
@@ -131,7 +187,7 @@ void build_context(struct ibv_context *verbs)
 
   TEST_Z(s_ctx->pd = ibv_alloc_pd(s_ctx->ctx));
   TEST_Z(s_ctx->comp_channel = ibv_create_comp_channel(s_ctx->ctx));
-  TEST_Z(s_ctx->cq = ibv_create_cq(s_ctx->ctx, 40, NULL, s_ctx->comp_channel, 0)); /* cqe=10 is arbitrary */
+  TEST_Z(s_ctx->cq = ibv_create_cq(s_ctx->ctx, 100, NULL, s_ctx->comp_channel, 0)); /* cqe=10 is arbitrary */
   TEST_NZ(ibv_req_notify_cq(s_ctx->cq, 0));
 
 //  TEST_NZ(pthread_create(&s_ctx->cq_poller_thread, NULL, poll_cq, NULL));
@@ -155,14 +211,16 @@ void * poll_cq(void *ctx)
 {
   struct ibv_cq *cq;
   struct ibv_wc wc;
-
   while (1) {
+ 
     TEST_NZ(ibv_get_cq_event(s_ctx->comp_channel, &cq, &ctx));
     ibv_ack_cq_events(cq, 1);
     TEST_NZ(ibv_req_notify_cq(cq, 0));
 
     while (ibv_poll_cq(cq, 1, &wc))
+    {
       on_completion(&wc);
+    }
   }
 
   return NULL;
@@ -189,6 +247,7 @@ void register_memory(struct connection *conn)
 {
   conn->send_region = (char *)malloc(BUFFER_SIZE);
   conn->recv_region = (char *)malloc(BUFFER_SIZE);
+  snprintf(conn->send_region, BUFFER_SIZE, "message from active/client side with pid %d", getpid());
 
   TEST_Z(conn->send_mr = ibv_reg_mr(
     s_ctx->pd, 
@@ -234,7 +293,10 @@ void on_completion(struct ibv_wc *wc)
   struct connection *conn = (struct connection *)(uintptr_t)wc->wr_id;
 
   if (wc->status != IBV_WC_SUCCESS)
+  {
+    cout << "status: " << wc->status << endl;
     die("on_completion: status is not IBV_WC_SUCCESS.");
+  }
 
   if (wc->opcode & IBV_WC_RECV)
     printf("received message: %s\n", conn->recv_region);
@@ -247,19 +309,19 @@ void on_completion(struct ibv_wc *wc)
 //    rdma_disconnect(conn->id);
 }
 
-void print_report(int iters, cycles_t *tposted, cycles_t *tcompleted, char *name)
+void print_report(int iter, cycles_t *tposted, cycles_t *tcompleted, char *name)
 {
   int i;
   double cpu_mhz = get_cpu_mhz(1);
   double lat_us;
   FILE *f = fopen(name, "w");
   fprintf(f, "iter\t\tLatency\n");
-  for(i = 0; i < iters; i++)
+  for(i = 0; i < iter; i++)
   {
     lat_us = (double)(tcompleted[i] - tposted[i]) / cpu_mhz;
     fprintf(f, "%ld\t\t%.2f\n", i + 1, lat_us);
   }
-  double total_lat = (double)(tcompleted[iters-1] - tposted[0]) / cpu_mhz;
+  double total_lat = (double)(tcompleted[iter-1] - tposted[0]) / cpu_mhz;
   fprintf(f, "\n%.2f\n", total_lat);
 
   fclose(f);
@@ -272,7 +334,8 @@ void * on_connection(void *arg)
   struct ibv_send_wr wr, *bad_wr = NULL;
   struct ibv_sge sge;
   struct ibv_wc wc;
-  snprintf(conn_ctx->send_region, BUFFER_SIZE, "message from active/client side with pid %d", getpid());
+  struct para_wr p_wr;
+//  snprintf(conn_ctx->send_region, BUFFER_SIZE, "message from active/client side with pid %d", getpid());
 
   printf("connected. posting send...\n");
 
@@ -284,12 +347,12 @@ void * on_connection(void *arg)
   wr.num_sge = 1;
   wr.send_flags = IBV_SEND_SIGNALED;
 
-  sge.addr = (uintptr_t)conn_ctx->send_region;
-  sge.length = BUFFER_SIZE;
-  sge.lkey = conn_ctx->send_mr->lkey;
-
-  int ne = 0, iters = 1000;
-  cycles_t *c1, *c2;
+  p_wr.addr = (uintptr_t)conn_ctx->send_region;
+  p_wr.length = BUFFER_SIZE;
+  p_wr.lkey = conn_ctx->send_mr->lkey;
+//  cout << "lkey: " << sge.lkey << endl;
+//  int ne = 0
+/*  cycles_t *c1, *c2;
   c1 = (cycles_t *)malloc(iters * sizeof *c1);
   pthread_t tid = pthread_self();
 
@@ -303,24 +366,118 @@ void * on_connection(void *arg)
   if (!c2)
   {
     perror("malloc");
-  }
+  }*/
+  
+  struct para *pa = (struct para *)arg;
+  
+//  pthread_mutex_lock(&mutex);
 
+ 
   for(int i = 0; i < iters; i++)
   {
-    c1[i] = get_cycles();
-    TEST_NZ(ibv_post_send(conn_ctx->qp, &wr, &bad_wr));
-    do {
-       ne = ibv_poll_cq(s_ctx->cq, 1, &wc);
-    } while (ne == 0); 
-    c2[i] = get_cycles();
-    on_completion(&wc);
+//    c1[i] = get_cycles();
+//    TEST_NZ(ibv_post_send(conn_ctx->qp, &wr, &bad_wr));
+    m[pa->efd].push_back(p_wr);
+//    do {
+//       ne = ibv_poll_cq(s_ctx->cq, 1, &wc);
+//    } while (ne == 0);
+//    c2[i] = get_cycles();
+//    on_completion(&wc);
 //    cout << endl << (unsigned int)tid << endl;
   }
+  
 
-  char *filename = (char *)arg;
-  print_report(iters, c1, c2, filename);
+//  pthread_mutex_unlock(&mutex);
+  uint64_t count = 1;
+  int ret = write(pa->efd, &count, sizeof(count));
+  if (ret < 0)
+    perror("write event fd fail:");
+
+
+//  print_report(iters, c1, c2, pa->filename);
 
 }
+
+void * worker(void *arg)
+{
+  struct para_worker *pa_worker = (struct para_worker *)arg;
+//  struct ibv_send_wr *bad_wr = NULL;
+  uint64_t number = 0;
+  int epfd = epoll_create(1000);
+  struct epoll_event ev;
+  struct epoll_event events[1000];
+  ev.events = EPOLLIN;
+  for(int i = 0; i < pa_worker->num; i++)
+  {
+    ev.data.fd = pa_worker->efd[i];
+    epoll_ctl(epfd, EPOLL_CTL_ADD, pa_worker->efd[i], &ev);
+  }
+
+  struct ibv_wc wc;
+  int ne = 0, start = 0;
+  cycles_t *c1, *c2;
+  c1 = (cycles_t *)malloc(iters * pa_worker->num * sizeof *c1);
+  pthread_t tid = pthread_self();
+
+  if (!c1)
+  {
+    perror("malloc");
+  }
+
+  c2 = (cycles_t *)malloc(iters * pa_worker->num * sizeof *c2);
+
+  if (!c2)
+  {
+    perror("malloc");
+  }
+
+  struct ibv_send_wr wr, *bad_wr = NULL;
+  memset(&wr, 0, sizeof(wr));
+  struct ibv_sge sge;
+
+  memset(&wr, 0, sizeof(wr));
+
+  wr.wr_id = (uintptr_t)conn_ctx;
+  wr.opcode = IBV_WR_SEND;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.send_flags = IBV_SEND_SIGNALED;
+
+  while(1)
+  {
+    int count = epoll_wait(epfd, events, 10, 2000);
+//    cout << "count:" << count <<endl;
+    for(int i = 0; i < count; i++)
+    {
+        read(events[i].data.fd, &number, sizeof(number));
+        
+        for(int j = 0; j < iters; j++)
+        {
+          sge.addr = m[events[i].data.fd][j].addr;
+          sge.length = m[events[i].data.fd][j].length;
+          sge.lkey = m[events[i].data.fd][j].lkey;
+
+          c1[start + j] = get_cycles();
+          TEST_NZ(ibv_post_send(conn_ctx->qp, &wr, &bad_wr));
+          do {
+            ne = ibv_poll_cq(s_ctx->cq, 1, &wc);
+          } while (ne == 0);
+          c2[start + j] = get_cycles();
+          on_completion(&wc);
+        }
+        
+        start = start + iters;
+//        cout << "start: " << start << endl;
+    }
+
+    if(start >= iters * pa_worker->num)
+    {
+      print_report(iters * pa_worker->num, c1, c2, "out.list");
+      break;
+    }
+  }
+}
+
 
 int on_disconnect(struct rdma_cm_id *id)
 {
